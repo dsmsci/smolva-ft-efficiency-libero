@@ -19,6 +19,7 @@ from .models import (
 )
 from .settings import (
     BUDGETS,
+    DATASET_RENAME_MAP,
     OUTPUTS,
     SEEN_REPO_ID,
     SEEN_TRAIN_ROOT,
@@ -82,8 +83,13 @@ def _load_policy(checkpoint: str | Path, dataset, *, lora: bool):
     config.pretrained_path = Path(checkpoint)
     config.device = "cuda"
     config.use_amp = False
+    config.empty_cameras = 1
 
-    policy = make_policy(cfg=config, ds_meta=dataset.meta)
+    policy = make_policy(
+        cfg=config,
+        ds_meta=dataset.meta,
+        rename_map=DATASET_RENAME_MAP,
+    )
     if lora:
         policy = policy.wrap_with_peft(
             peft_cli_overrides={
@@ -99,6 +105,9 @@ def _load_policy(checkpoint: str | Path, dataset, *, lora: bool):
         dataset_stats=dataset.meta.stats,
         preprocessor_overrides={
             "device_processor": {"device": "cuda"},
+            "rename_observations_processor": {
+                "rename_map": DATASET_RENAME_MAP,
+            },
             "normalizer_processor": {
                 "stats": dataset.meta.stats,
                 "features": {
@@ -137,6 +146,9 @@ def _seen_preprocessor(seen_checkpoint: str | Path, policy):
         dataset_stats=seen_meta.stats,
         preprocessor_overrides={
             "device_processor": {"device": "cuda"},
+            "rename_observations_processor": {
+                "rename_map": DATASET_RENAME_MAP,
+            },
             "normalizer_processor": {
                 "stats": seen_meta.stats,
                 "features": {

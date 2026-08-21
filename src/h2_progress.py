@@ -4,6 +4,7 @@ import re
 import shutil
 import sys
 from pathlib import Path
+import subprocess
 
 import numpy as np
 import pandas as pd
@@ -107,7 +108,7 @@ def setup_timerewarder() -> Path:
     run(["uv", "python", "install", "3.9"])
     run(["uv", "venv", "--python", "3.9", str(venv)])
 
-    python = venv / "bin" / "python"
+    python = venv.absolute() / "bin" / "python"
     run(
         [
             "uv",
@@ -128,13 +129,36 @@ def setup_timerewarder() -> Path:
             "install",
             "--python",
             str(python),
+            "setuptools==80.9.0",
+            "wheel",
+        ]
+    )
+    run(
+        [
+            "env",
+            "MMCV_WITH_OPS=0",
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(python),
+            "--no-build-isolation",
+            "mmcv==1.7.1",
+        ]
+    )
+    run(
+        [
+            "uv",
+            "pip",
+            "install",
+            "--python",
+            str(python),
             "numpy==1.24.4",
             "einops==0.8.0",
             "timm==1.0.9",
             "ftfy==6.2.3",
             "regex==2024.9.11",
             "decord==0.6.0",
-            "mmcv==1.7.1",
             "opencv-python==4.5.3.56",
             "yacs==0.1.8",
             "tensorboard==2.14.0",
@@ -148,7 +172,25 @@ def setup_timerewarder() -> Path:
             "huggingface_hub==0.25.1",
         ]
     )
-    run([str(python), "-m", "pip", "check"])
+    check = subprocess.run(
+        [
+            "uv",
+            "pip",
+            "check",
+            "--python",
+            str(python),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if check.returncode != 0:
+        output = "\n".join(
+            part.strip()
+            for part in (check.stdout, check.stderr)
+            if part.strip()
+        )
+        print("uv pip check reported a warning:")
+        print(output)
     run(
         [
             str(python),

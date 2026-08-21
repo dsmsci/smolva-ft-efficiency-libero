@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
 from .data import subset_root, target_repo_id
 from .settings import (
     BASE_MODEL,
+    DATASET_RENAME_MAP,
     BUDGETS,
     OUTPUTS,
     SEEN_REPO_ID,
@@ -66,6 +68,8 @@ def train_cli(
             "--policy.device=cuda",
             "--policy.push_to_hub=false",
             "--wandb.enable=false",
+            "--policy.empty_cameras=1",
+            f"--rename_map={json.dumps(DATASET_RENAME_MAP)}",
             f"--steps={steps}",
             f"--batch_size={batch_size}",
             f"--policy.scheduler_decay_steps={steps}",

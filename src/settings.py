@@ -3,6 +3,16 @@ from pathlib import Path
 DATASET_ID = "nvidia/LIBERO_LeRobot_v3"
 BASE_MODEL = "lerobot/smolvla_base"
 
+DATASET_RENAME_MAP = {
+    "observation.images.image": "observation.images.camera1",
+    "observation.images.wrist_image": "observation.images.camera2",
+}
+
+ENV_RENAME_MAP = {
+    "observation.images.image": "observation.images.camera1",
+    "observation.images.image2": "observation.images.camera2",
+}
+
 TARGETS = {
     0: "open the middle drawer of the cabinet",
     1: "put the bowl on the stove",

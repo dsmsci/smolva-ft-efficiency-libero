@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 import torch
 
-from .settings import OUTPUTS, TARGETS
+from .settings import ENV_RENAME_MAP, OUTPUTS, TARGETS
 from .utils import run
 
 WRONG_LANGUAGE = {
@@ -35,6 +35,7 @@ def eval_checkpoint(
             "lerobot-eval",
             f"--policy.path={checkpoint}",
             "--policy.device=cuda",
+            f"--rename_map={json.dumps(ENV_RENAME_MAP)}",
             "--env.type=libero",
             "--env.task=libero_goal",
             f"--env.task_ids={json.dumps(list(task_ids))}",
@@ -102,6 +103,7 @@ def eval_wrong_language(
     config = PreTrainedConfig.from_pretrained(checkpoint)
     config.pretrained_path = Path(checkpoint)
     config.device = "cuda"
+    config.empty_cameras = 1
 
     rows = []
     for task_id, wrong_text in WRONG_LANGUAGE.items():
@@ -112,13 +114,20 @@ def eval_wrong_language(
             hard_reset=True,
             control_mode="relative",
         )
-        policy = make_policy(cfg=config, env_cfg=env_config)
+        policy = make_policy(
+            cfg=config,
+            env_cfg=env_config,
+            rename_map=ENV_RENAME_MAP,
+        )
         policy.eval()
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=config,
             pretrained_path=config.pretrained_path,
             preprocessor_overrides={
-                "device_processor": {"device": "cuda"}
+                "device_processor": {"device": "cuda"},
+                "rename_observations_processor": {
+                    "rename_map": ENV_RENAME_MAP,
+                },
             },
         )
         env_preprocessor, env_postprocessor = make_env_pre_post_processors(
