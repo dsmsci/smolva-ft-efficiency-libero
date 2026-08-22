@@ -1,7 +1,6 @@
 data/
 outputs/
-results/
-_external/
+.venv/
 __pycache__/
 .ipynb_checkpoints/
 *.pyc

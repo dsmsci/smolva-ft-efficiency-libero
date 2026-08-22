@@ -7,51 +7,83 @@ from pathlib import Path
 import pandas as pd
 import torch
 
+from .data import seen_sanity_tasks
 from .settings import ENV_RENAME_MAP, OUTPUTS, TARGETS
 from .utils import run
 
-WRONG_LANGUAGE = {
-    0: TARGETS[1],
-    1: TARGETS[2],
-    2: TARGETS[0],
-}
+WRONG_LANGUAGE = {0: TARGETS[1], 1: TARGETS[2], 2: TARGETS[0]}
+
+
+def _existing_video_path(value: str | None, result_json: Path) -> Path | None:
+    if not value:
+        return None
+    raw = Path(value)
+    candidates = [raw]
+    if not raw.is_absolute():
+        candidates.extend([result_json.parent / raw, Path.cwd() / raw])
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def prune_eval_videos(result_json: str | Path, keep_failed_per_task: int = 1) -> None:
+    """Retain only a small failure sample; JSON metrics remain untouched."""
+    result_json = Path(result_json)
+    info = json.loads(result_json.read_text(encoding="utf-8"))
+    for task in info.get("per_task", []):
+        metrics = task.get("metrics", {})
+        successes = metrics.get("successes", [])
+        videos = metrics.get("video_paths", [])
+        kept_failures = 0
+        for episode, value in enumerate(videos):
+            path = _existing_video_path(value, result_json)
+            if path is None:
+                continue
+            is_failure = episode < len(successes) and not bool(successes[episode])
+            keep = is_failure and kept_failures < keep_failed_per_task
+            if keep:
+                kept_failures += 1
+            else:
+                path.unlink(missing_ok=True)
 
 
 def eval_checkpoint(
     checkpoint: str | Path,
     tag: str,
-    task_ids: tuple[int, ...],
+    task_ids: tuple[int, ...] | list[int],
     *,
+    suite: str = "libero_goal",
     n_episodes: int = 20,
     seed: int = 10_000,
+    keep_failed_videos: int = 1,
 ) -> Path:
     output = OUTPUTS / "eval" / tag
     result = output / "eval_info.json"
-    if result.exists():
-        return result
-
-    run(
-        [
-            "lerobot-eval",
-            f"--policy.path={checkpoint}",
-            "--policy.device=cuda",
-            f"--rename_map={json.dumps(ENV_RENAME_MAP)}",
-            "--env.type=libero",
-            "--env.task=libero_goal",
-            f"--env.task_ids={json.dumps(list(task_ids))}",
-            "--env.control_mode=relative",
-            "--env.init_states=true",
-            "--env.hard_reset=true",
-            "--eval.batch_size=1",
-            f"--eval.n_episodes={n_episodes}",
-            "--eval.use_async_envs=false",
-            f"--seed={seed}",
-            f"--output_dir={output}",
-        ],
-        log_path=OUTPUTS / "logs" / f"eval__{tag}.log",
-    )
+    if not result.exists():
+        run(
+            [
+                "lerobot-eval",
+                f"--policy.path={checkpoint}",
+                "--policy.device=cuda",
+                f"--rename_map={json.dumps(ENV_RENAME_MAP)}",
+                "--env.type=libero",
+                f"--env.task={suite}",
+                f"--env.task_ids={json.dumps([int(x) for x in task_ids])}",
+                "--env.control_mode=relative",
+                "--env.init_states=true",
+                "--env.hard_reset=true",
+                "--eval.batch_size=1",
+                f"--eval.n_episodes={int(n_episodes)}",
+                "--eval.use_async_envs=false",
+                f"--seed={int(seed)}",
+                f"--output_dir={output}",
+            ],
+            log_path=OUTPUTS / "logs" / f"eval__{tag}.log",
+        )
     if not result.exists():
         raise FileNotFoundError(result)
+    prune_eval_videos(result, keep_failed_per_task=keep_failed_videos)
     return result
 
 
@@ -71,6 +103,7 @@ def evaluate_grid(
             (task_id,),
             n_episodes=n_episodes,
             seed=seed,
+            keep_failed_videos=1,
         )
         specs.append(
             {
@@ -82,6 +115,26 @@ def evaluate_grid(
             }
         )
     return specs
+
+
+def eval_seen_sanity(
+    checkpoint: str | Path,
+    *,
+    n_tasks: int = 3,
+    n_episodes: int = 5,
+    seed: int = 9_000,
+) -> tuple[Path, list[tuple[int, str]]]:
+    tasks = seen_sanity_tasks(n_tasks)
+    result = eval_checkpoint(
+        checkpoint,
+        "seen_sanity",
+        [task_id for task_id, _ in tasks],
+        suite="libero_90",
+        n_episodes=n_episodes,
+        seed=seed,
+        keep_failed_videos=0,
+    )
+    return result, tasks
 
 
 def eval_wrong_language(
@@ -114,52 +167,47 @@ def eval_wrong_language(
             hard_reset=True,
             control_mode="relative",
         )
-        policy = make_policy(
-            cfg=config,
-            env_cfg=env_config,
-            rename_map=ENV_RENAME_MAP,
-        )
+        policy = make_policy(cfg=config, env_cfg=env_config, rename_map=ENV_RENAME_MAP)
         policy.eval()
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=config,
             pretrained_path=config.pretrained_path,
             preprocessor_overrides={
                 "device_processor": {"device": "cuda"},
-                "rename_observations_processor": {
-                    "rename_map": ENV_RENAME_MAP,
-                },
+                "rename_observations_processor": {"rename_map": ENV_RENAME_MAP},
             },
         )
-        env_preprocessor, env_postprocessor = make_env_pre_post_processors(
-            env_config,
-            config,
-        )
-        envs = make_env(
-            env_config,
-            n_envs=1,
-            use_async_envs=False,
-        )
+        env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_config, config)
+        envs = make_env(env_config, n_envs=1, use_async_envs=False)
         env = next(iter(next(iter(envs.values())).values()))
 
         def wrong_preprocessor(observation):
             patched = dict(observation)
-            patched["task"] = [wrong_text] * len(
-                patched.get("task", [None])
-            )
+            task_value = patched.get("task")
+            if isinstance(task_value, str) or task_value is None:
+                batch_n = getattr(env, "num_envs", 1)
+            else:
+                try:
+                    batch_n = len(task_value)
+                except TypeError:
+                    batch_n = getattr(env, "num_envs", 1)
+            patched["task"] = [wrong_text] * int(batch_n)
             return preprocessor(patched)
 
-        info = eval_policy(
-            env=env,
-            policy=policy,
-            env_preprocessor=env_preprocessor,
-            env_postprocessor=env_postprocessor,
-            preprocessor=wrong_preprocessor,
-            postprocessor=postprocessor,
-            n_episodes=n_episodes,
-            max_episodes_rendered=0,
-            start_seed=seed,
-        )
-        env.close()
+        try:
+            info = eval_policy(
+                env=env,
+                policy=policy,
+                env_preprocessor=env_preprocessor,
+                env_postprocessor=env_postprocessor,
+                preprocessor=wrong_preprocessor,
+                postprocessor=postprocessor,
+                n_episodes=n_episodes,
+                max_episodes_rendered=0,
+                start_seed=seed,
+            )
+        finally:
+            env.close()
 
         for episode in info["per_episode"]:
             rows.append(
@@ -173,13 +221,7 @@ def eval_wrong_language(
                 }
             )
 
-        del (
-            policy,
-            preprocessor,
-            postprocessor,
-            env_preprocessor,
-            env_postprocessor,
-        )
+        del policy, preprocessor, postprocessor, env_preprocessor, env_postprocessor
         gc.collect()
         torch.cuda.empty_cache()
 

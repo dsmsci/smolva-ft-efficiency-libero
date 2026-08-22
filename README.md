@@ -1,193 +1,213 @@
-# SmolVLA adaptation on LIBERO
+# SmolVLA: адаптация к новым задачам LIBERO при малом числе демонстраций
 
-Ноутбук (Experiments) запускает полный pipeline: подготовка LIBERO, seen fine-tuning, K=0 language control, target baselines, две исследовательские гипотезы, evaluation, Bonus B и выбор failure rollouts.
 
-Исследуемые методы:
+## Данные и обязательные проверки
 
-- H1: latent dynamics regularization.
-- H2: video progress from TimeRewarder with RA-BC.
+Используется `nvidia/LIBERO_LeRobot_v3`:
 
+- исходная часть для предварительного дообучения - `libero_90`;
+- целевая часть - `libero_goal`;
+- три задачи выбираются **по точному тексту инструкции**, а не по номеру строки датасета:
+  1. `open the middle drawer of the cabinet`;
+  2. `put the bowl on the stove`;
+  3. `put the wine bottle on top of the cabinet`.
+
+### 1. Команда гриппера
+
+В NVIDIA-конверсии `g_data=1` означает открытый гриппер, а среда LIBERO использует `+1` для закрытия. В рабочей копии применяется
+
+\[
+g_{env}=1-2g_{data}.
+\]
+
+После подготовки `replay_gripper_smoke()` воспроизводит одну реальную демонстрацию каждой из трёх целевых задач непосредственно в LIBERO. Для выбора соответствующего начального состояния сравнивается первый кадр демонстрации с доступными начальными состояниями. Каждое из трёх воспроизведений должно завершиться успехом; иначе ноутбук прекращает работу до обучения.
+
+### 2. Строго первые 5/10/25 демонстраций
+
+`target_episode_ids()` находит эпизоды по точному тексту задачи и выбирает первые K исходных идентификаторов. После этого выбор повторно открывается через `LeRobotDataset(..., episodes=chosen)` и проверяется на точное совпадение идентификаторов и количества эпизодов. Фактический выбор записывается в `data/target_manifest.csv`.
+
+Для каждой пары `(задача, K)` создаётся лёгкое представление в `data/views/`. Данные и видео не копируются, а статистики числовых признаков пересчитываются только по выбранным K эпизодам. Визуальная нормировка SmolVLA тождественная (`IDENTITY`), поэтому сохранённые общие статистики изображений на вычисления политики не влияют. Таким образом демонстрации других целевых задач не используются и через нормировку.
+
+### 3. Видео без обязательной перекодировки
+
+Исходные `.mp4` читаются через `torchcodec` (`video_backend="torchcodec"`). `prepare_data()` до обучения декодирует реальные кадры из `libero_90` и `libero_goal`.
+
+### 4. Проверка seen-чекпойнта
+
+Нулевой результат на новых задачах `libero_goal` сам по себе допустим. Поэтому после предварительного дообучения отдельно выбираются три задачи, реально присутствующие в `libero_90`, и для каждой выполняются 5 эпизодов. Если итог равен `0/15`, дальнейшая дорогая сетка останавливается.
+
+### 5. Проверка H1–H4 до основной сетки
+
+После языкового контроля, но **до 18 обучений базового метода**, один раз строятся прототипы H1 и выполняется настоящий прямой и обратный проход для H1, H2, H3 и H4 на реальном батче `K=5`. Шаг оптимизатора не выполняется, контрольная точка не создаётся. Проверяются конечность функции потерь, наличие конечных градиентов, размерности, процессоры, доступ к скрытым токенам и совместимость seen-батча H4 с целевой нормировкой.
+
+Прототипы H1 содержат параметры построения и сигнатуру seen-чекпойнта. Если seen-веса или параметры H1 изменились, старый файл не переиспользуется.
+
+## Языковой контроль
+
+`K=0` оценивается дважды на одинаковых парах «задача × начальное состояние»:
+
+1. с правильной инструкцией;
+2. с циклически подменённой инструкцией другой целевой задачи.
+
+Результат `correct=0` и `wrong=0` не доказывает, что модель игнорирует язык; в `results/language_control_summary.csv` он помечается как неинформативный.
 
 ## Структура репозитория
 
 ```text
 .
-├── Experiments.ipynb
-├── src/
-│   ├── __init__.py
-│   ├── settings.py
-│   ├── utils.py
-│   ├── data.py
-│   ├── models.py
-│   ├── train_baselines.py
-│   ├── h1_dynamics.py
-│   ├── h2_progress.py
-│   ├── timerewarder_runner.py
-│   ├── evaluation.py
-│   ├── analysis.py
-│   └── bonus.py
+├── Experiments.ipynb          # последовательный запуск всего эксперимента
+├── Predictions.md             # предсказания до запусков
+├── Summary.docx               # итоговый отчёт
 ├── README.md
-├── REPORT.docx
 ├── requirements.txt
-└── .gitignore
+└── src/
+    ├── settings.py            # датасет, задачи, бюджеты и пути
+    ├── utils.py               # общие служебные функции
+    ├── data.py                # загрузка, гриппер, выбор эпизодов, ранние проверки
+    ├── train_baselines.py     # seen-дообучение и базовый метод через lerobot-train
+    ├── training.py            # общий цикл обучения H1–H4
+    ├── methods.py             # четыре гипотезы
+    ├── evaluation.py          # оценка LIBERO и языковой контроль
+    └── analysis.py            # итоговые таблицы и интервалы
 ```
 
-`Experiments.ipynb` описывает и запускает эксперимент сверху вниз.
+## Среда
 
-`src/settings.py` хранит dataset/model IDs, target instructions, K, seeds и пути runtime-каталогов.
-
-`src/data.py` скачивает `nvidia/LIBERO_LeRobot_v3`, исправляет gripper convention, пересчитывает dataset statistics, создаёт first-K target subsets и выполняет replay smoke test.
-
-`src/models.py` содержит только собственные model-level компоненты H1: `DynamicsConfig`, `LatentDynamicsHead`, latent pooling, dynamics loss и восстановление clean action chunk из SmolVLA flow velocity.
-
-`src/train_baselines.py` запускает seen fine-tuning, обязательный native target fine-tune и matched LoRA-only control через официальный `lerobot-train`.
-
-`src/h1_dynamics.py` содержит seen-only training dynamics prior и target LoRA training loop с latent-dynamics regularization.
-
-`src/h2_progress.py` готовит target videos, обучает официальный TimeRewarder, переводит его reward в progress и запускает official RA-BC target training.
-
-`src/timerewarder_runner.py` — небольшой runner для TimeRewarder inference в его отдельном Python environment.
-
-`src/evaluation.py` запускает `lerobot-eval`, target checkpoint evaluation и paired K=0 wrong-instruction control.
-
-`src/analysis.py` собирает rollout-level success, success rates с простым Wilson 95% interval, cost curve и список failed videos.
-
-`src/bonus.py` оценивает rollout videos через TimeRewarder и Robometer-4B-LIBERO и считает ranking/proxy-pressure metrics.
-
-`src/utils.py` содержит только общий subprocess runner с записью логов.
-
-## Порядок эксперимента
-
-Notebook выполняет:
+Расчётная среда - Linux, Python 3.12 и NVIDIA RTX 6000-класса. Версии в `requirements.txt` сохранены из рабочей среды. Ключевые зависимости:
 
 ```text
-data
--> gripper replay
--> seen policy on full libero_90
--> K=0 correct/wrong instruction
--> native baseline
--> LoRA-only control
--> H1 latent dynamics
--> H2 TimeRewarder + RA-BC
--> main evaluation
--> Bonus B
--> failure candidates
+lerobot==0.6.1
+torch==2.11.0+cu128
+torchvision==0.26.0+cu128
+torchcodec==0.11.1
+transformers==5.5.4
+datasets==4.8.5
+hf_libero==0.1.4
 ```
 
-Target budgets: `K = 5, 10, 25`.
-
-Target-policy training seeds: `42, 123`.
-
-Evaluation: 20 LIBERO episodes на каждую task/method/K/seed cell. K=0 использует один shared seen checkpoint.
-
-## Runtime outputs
-
-Runtime-каталоги не входят в git.
-
-```text
-data/
-├── raw/                         downloaded NVIDIA suites
-├── fixed/                       gripper-corrected libero_90/libero_goal
-├── subsets/                     physical first-K target datasets
-├── timerewarder/                videos prepared for TimeRewarder
-└── subset_manifest.csv          exact source episodes used in each K
-
-outputs/
-├── seen/                        seen-policy checkpoint
-├── heads/h1_dynamics/           H1 latent-dynamics prior
-├── target/
-│   ├── native/                  assignment baseline checkpoints
-│   ├── lora/                    matched LoRA-only checkpoints
-│   ├── h1_dynamics/             H1 policy checkpoints
-│   └── h2_progress/             H2 RA-BC policy checkpoints
-├── reward/
-│   ├── timerewarder/            TimeRewarder checkpoints
-│   └── progress/                progress parquet files for RA-BC
-├── eval/                        raw LeRobot eval artifacts and rollout videos
-├── bonus_b/                     raw reward-model inference artifacts
-└── logs/                        training/evaluation logs
-
-results/
-├── replay_smoke.csv
-├── language_control.csv
-├── language_control_summary.csv
-├── evaluation.csv               rollout-level simulator success
-├── success_rates.csv            success + Wilson 95% CI by method/task/K/train seed
-├── cost_curve.csv
-├── cost_curve.png
-├── bonus_b/
-│   ├── scores.csv
-│   ├── checkpoint_scores.csv
-│   ├── ranking.csv
-│   └── reward_pressure.csv
-└── failure_candidates.csv
-```
-
-
-## Hardware
-
-Финальный notebook рассчитан на один Linux-сервер класса:
-
-```text
-GPU: NVIDIA RTX PRO 6000 Blackwell, 96 GB
-vCPU: 16+
-free SSD: 200 GB recommended, 150 GB hard minimum
-NVIDIA driver: >= 570.86
-```
-
-Batch sizes фиксированы и не меняются автоматически:
-
-```text
-seen policy:       32
-target policies:    8
-H1 dynamics prior: 32
-TimeRewarder:      16
-```
-
-Основная среда проекта фиксирована на Python 3.12, LeRobot 0.6.1 и PyTorch 2.11.0 + CUDA 12.8. Notebook проверяет эти версии, CUDA, `ffmpeg`, минимум 80 GB VRAM и свободное место до начала обучения.
-
-TimeRewarder запускается из отдельного окружения, которое `src/h2_progress.py` создаёт через `uv`: Python 3.9, PyTorch 2.7.1 + CUDA 12.8. Это Blackwell-compatible patch поверх исходного TimeRewarder environment, который был рассчитан на старый PyTorch/CUDA stack. Системные `libgl1/libegl1/libglib2.0-0` устанавливаются заранее, поэтому старый OpenCV/MMCV stack не зависит от desktop session.
-
-Robometer остаётся в собственном `uv`-окружении его официального репозитория.
-
-Для headless LIBERO notebook до импортов задаёт:
-
-```text
-MUJOCO_GL=egl
-PYOPENGL_PLATFORM=egl
-```
-
-
-## Запуск
-
-Требуются Linux, NVIDIA driver с поддержкой CUDA 12.8, Python 3.12 и persistent disk. Для Ubuntu/Debian перед Python environment системные зависимости:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y git ffmpeg libgl1 libegl1 libglib2.0-0
-```
-
-Создайте основную среду именно на Python 3.12 и установите зависимости до запуска Jupyter:
+Установка:
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install torch==2.11.0 torchvision==0.26.0 \
-  --index-url https://download.pytorch.org/whl/cu128
+python -m pip install torch==2.11.0+cu128 torchvision==0.26.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 python -m pip install -r requirements.txt
 python -m pip check
-python -m jupyter notebook
 ```
 
-Откройте `Experiments.ipynb` из корня репозитория и выполняйте ячейки сверху вниз. Setup-ячейки повторно проверяют requirements и фактические версии Python, LeRobot, PyTorch/CUDA, GPU, `ffmpeg` и свободный диск до начала обучения.
+Если нужная сборка PyTorch уже установлена и `pip check` проходит, переустанавливать её не требуется.
 
-PyTorch ставится отдельной официальной CUDA 12.8 командой до `requirements.txt`; это исключает неоднозначность между CPU/PyPI и CUDA wheels. `requirements.txt` затем pin-ит LeRobot и совместимые dependency ranges:
+Перед запуском можно проверить систему:
+
+```bash
+nvidia-smi
+ffmpeg -version
+python -c "import torch, lerobot, torchcodec; print(torch.__version__, torch.version.cuda, lerobot.__version__); print(torch.cuda.get_device_name(0))"
+```
+
+Первая ячейка ноутбука дополнительно проверяет Python 3.12, `lerobot==0.6.1`, PyTorch 2.11.0, CUDA 12.8, `torchcodec==0.11.1`, доступность CUDA и память GPU. Значения по умолчанию рассчитаны на карту с не менее чем 40 ГБ VRAM.
+
+## Запуск
+
+Рекомендуемый вариант:
+
+```bash
+source .venv/bin/activate
+jupyter lab Experiments.ipynb
+```
+
+Выполнять ячейки строго сверху вниз. Последовательность:
+
+1. проверка среды;
+2. `prepare_data()` - загрузка, исправление гриппера, декодирование видео, проверка первых K и статистик;
+3. воспроизведение трёх реальных демонстраций;
+4. расчёт числа шагов;
+5. предварительное дообучение на `libero_90`;
+6. проверка seen-чекпойнта: 3 задачи × 5 эпизодов; `0/15` останавливает запуск;
+7. `K=0` и контроль с подменённой инструкцией;
+8. построение H1 и однопроходная проверка H1–H4;
+9. базовый метод для `K=5/10/25`, двух сидов и трёх задач; затем оценка;
+10. H1, H2, H3, H4 - обучение и оценка;
+11. объединение результатов в компактные CSV.
+
+Для полностью неинтерактивного воспроизведения:
+
+```bash
+jupyter nbconvert --to notebook --execute Experiments.ipynb \
+  --ExecutePreprocessor.timeout=-1 \
+  --output /tmp/Experiments.executed.ipynb
+```
+
+Для первого дорогого запуска безопаснее выполнять ноутбук последовательно хотя бы до завершения пунктов 2, 3, 6 и 8, прежде чем запускать полную сетку.
+
+### Число шагов
+
+По умолчанию:
+
+```python
+SEEN_BATCH = 32
+TARGET_BATCH = 8
+H1_PRIOR_BATCH = 16
+seen_steps = ceil(2.0 * seen_frames / SEEN_BATCH)
+target_samples = max(6400, ceil(2.5 * target_frames))
+target_steps = ceil(target_samples / TARGET_BATCH)
+```
+
+H1–H4 получают столько же **целевых** шагов, сколько `baseline` в соответствующей клетке `(task, K)`. H4 дополнительно считает seen-функцию потерь каждый четвёртый шаг.
+
+## Что сохраняется
 
 ```text
-lerobot[training,evaluation,smolvla,libero,peft,sarm,notebook]==0.6.1
+data/
+├── raw/                       # исходный скачанный датасет
+├── fixed/                     # рабочая копия с исправленным гриппером
+├── views/                     # лёгкие представления K-выборок и их статистики
+└── target_manifest.csv        # точные исходные id для K=5/10/25
+
+outputs/
+├── seen/seed_7/final/
+├── priors/h1_video_dynamics.pt
+├── target/{baseline,h1,h2,h3,h4}/.../final/
+├── eval/.../eval_info.json
+└── logs/*.log
+
+results/
+├── replay_smoke.csv
+├── seen_sanity.csv
+├── language_control.csv
+├── language_control_summary.csv
+├── evaluation.csv
+├── success_rates.csv
+├── cost_curve.csv
+└── failure_candidates.csv
 ```
 
-До полного запуска рекомендуется выполнить setup, data preparation и replay smoke. Все три target demonstrations должны replay-иться с `success=True`; если это не так, дальнейший training запускать нельзя.
+После успешного обучения клетки промежуточные контрольные точки удаляются, остаются только `/final/`. Официальная оценка LeRobot может отрисовать только часть из 20 оценочных эпизодов; из реально сохранённых видео код оставляет не более одного неуспешного на клетку и удаляет остальные видео. Численные метрики при этом считаются по всем 20 эпизодам.
 
-Повторный запуск безопасен для законченных stages: функции возвращают уже существующие final checkpoints или raw eval artifacts. Незавершённый стандартный LeRobot training resume-ится из `checkpoints/last`. H1 сохраняет собственный lightweight resume state.
+`Summary.docx` уже содержит ссылки на таблицы в `results/`; после прогонов туда требуется внести фактические числа и три выбранных провала.
+
+## Продолжение после прерывания
+
+- `prepare_data()` повторно использует полностью подготовленные `data/fixed/*` и `data/views/*`.
+- Штатное обучение seen-чекпойнта и `baseline` продолжается через `checkpoints/last/pretrained_model/train_config.json` и `--resume=true`.
+- H1–H4 используют `checkpoints/last.pt` и восстанавливают обучаемые веса, вспомогательную голову при её наличии, оптимизатор, планировщик скорости обучения и состояния Python/NumPy/Torch/CUDA генераторов случайных чисел.
+- Для H4 сохранение выполняется только на шагах, кратных 500; при `replay_interval=4` это одновременно граница цикла seen-подмешивания, поэтому положение обоих потоков восстанавливается согласованно.
+- Если `final/` уже существует, соответствующая клетка повторно не обучается.
+- Если `eval_info.json` существует, оценка повторно не выполняется.
+- Если каталог обучения существует, но пригодной контрольной точки нет, код останавливается вместо попытки угадать состояние.
+
+## Соответствие заданию
+
+- предварительное дообучение: `libero_90`;
+- цели: три требуемые задачи `libero_goal`, найденные по тексту инструкции;
+- `K=0`: seen-чекпойнт без целевого обучения;
+- `K=5/10/25`: первые K демонстраций каждой целевой задачи;
+- базовый метод фиксируется до H1–H4;
+- H1–H4 не используют демонстрации других целевых задач;
+- статистики числовой нормировки для `K>0` вычисляются только по соответствующим первым K демонстрациям;
+- оценка: 20 эпизодов на задачу и точку, два сида обучения для `K>0`;
+- H1 использует seen-видео без действий и одновременно является экспериментом для Bonus A;
+- 95% интервалы Wilson сохраняются в `results/success_rates.csv`;
+- разбор провалов строится по реальным сохранённым траекториям из `results/failure_candidates.csv`;
+- выбран только Bonus A.

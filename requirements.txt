@@ -1,4 +1,3 @@
-# Включая ninja v1.11.1
 absl-py==2.5.0
 accelerate==1.14.0
 aiohappyeyeballs==2.7.1
@@ -36,7 +35,7 @@ debugpy==1.8.21
 defusedxml==0.7.1
 dill==0.4.1
 docopt==0.6.2
-draccus==0.11.6
+draccus==0.10.0
 easydict==1.13
 egl_probe==1.0.2
 einops==0.8.2
@@ -145,7 +144,6 @@ packaging==25.0
 pandas==2.3.3
 pandocfilters==1.5.1
 parso==0.8.7
-peft==0.20.0
 pexpect==4.9.0
 pillow==12.3.0
 platformdirs==4.11.3
@@ -216,7 +214,6 @@ typing_extensions==4.16.0
 tzdata==2026.3
 uri-template==1.3.0
 urllib3==2.7.0
-uv==0.12.5
 wandb==0.27.2
 wcwidth==0.8.2
 webcolors==25.10.0

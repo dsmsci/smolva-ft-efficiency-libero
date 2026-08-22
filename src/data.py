@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import json
 import os
 import shutil
-import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -14,33 +12,15 @@ from .settings import (
     DATA,
     DATASET_ID,
     FIXED,
+    GOAL_REPO_ID,
+    GOAL_TRAIN_ROOT,
     RAW,
     SEEN_REPO_ID,
     SEEN_TRAIN_ROOT,
-    SUBSETS,
     TARGETS,
+    VIDEO_BACKEND,
+    VIEWS,
 )
-
-H264 = DATA / "h264"
-
-
-def _copy_dataset_for_mutation(src: Path, dst: Path) -> None:
-    if dst.exists():
-        return
-
-    def copy_file(source, destination):
-        if Path(source).suffix.lower() == ".mp4":
-            try:
-                os.link(source, destination)
-                return destination
-            except OSError:
-                pass
-        return shutil.copy2(source, destination)
-
-    tmp = dst.with_name(dst.name + ".tmp")
-    shutil.rmtree(tmp, ignore_errors=True)
-    shutil.copytree(src, tmp, copy_function=copy_file)
-    tmp.replace(dst)
 
 
 def _download_suite(suite: str) -> Path:
@@ -56,424 +36,400 @@ def _download_suite(suite: str) -> Path:
     )
     root = repo_dir / suite
     if not (root / "meta" / "info.json").exists():
-        raise FileNotFoundError(root)
+        raise FileNotFoundError(f"Dataset suite was not downloaded correctly: {root}")
     return root
 
 
-def _video_codec(path: Path) -> str:
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=codec_name",
-            "-of",
-            "default=nw=1:nk=1",
-            str(path),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip()
+def _copy_for_action_fix(src: Path, dst: Path) -> None:
+    """Copy metadata/data, hard-link videos when possible, and never mutate raw files."""
+
+    def copy_file(source: str, destination: str):
+        source_path = Path(source)
+        if source_path.suffix.lower() == ".mp4":
+            try:
+                os.link(source, destination)
+                return destination
+            except OSError:
+                pass
+        return shutil.copy2(source, destination)
+
+    shutil.copytree(src, dst, copy_function=copy_file)
 
 
-def _copy_non_video_files(src: Path, dst: Path) -> None:
-    def ignore_videos(directory, names):
-        return [name for name in names if name.lower().endswith(".mp4")]
+def _convert_gripper_parquets(root: Path) -> None:
+    """NVIDIA LIBERO: g_data in {0,1}, 1=open. Env: +1=close, -1=open."""
+    parquets = sorted((root / "data").rglob("*.parquet"))
+    if not parquets:
+        raise RuntimeError(f"No parquet files found under {root / 'data'}")
 
-    shutil.copytree(
-        src,
-        dst,
-        dirs_exist_ok=True,
-        ignore=ignore_videos,
-    )
+    observed_min = np.inf
+    observed_max = -np.inf
 
+    for parquet in parquets:
+        frame = pd.read_parquet(parquet)
+        if "action" not in frame.columns:
+            raise KeyError(f"{parquet}: action column is missing")
 
-def _patch_h264_metadata(root: Path) -> None:
-    info_path = root / "meta" / "info.json"
-    if not info_path.exists():
-        raise FileNotFoundError(info_path)
+        converted = []
+        for raw_action in frame["action"]:
+            action = np.asarray(raw_action, dtype=np.float32).copy()
+            if action.shape[-1] != 7:
+                raise ValueError(f"{parquet}: expected action dim 7, got {action.shape}")
+            gripper = np.asarray(action[..., -1], dtype=np.float32)
+            observed_min = min(observed_min, float(np.min(gripper)))
+            observed_max = max(observed_max, float(np.max(gripper)))
+            if float(np.min(gripper)) < -1e-4 or float(np.max(gripper)) > 1.0001:
+                raise ValueError(
+                    f"{parquet}: source gripper must be in [0,1], got "
+                    f"[{float(np.min(gripper)):.4f}, {float(np.max(gripper)):.4f}]. "
+                    "Refusing to convert twice."
+                )
+            action[..., -1] = 1.0 - 2.0 * gripper
+            converted.append(action.tolist())
 
-    info = json.loads(info_path.read_text(encoding="utf-8"))
-    info.pop("data_files", None)
+        frame["action"] = converted
+        frame.to_parquet(parquet, index=False)
 
-    video_features = 0
-    for feature in info.get("features", {}).values():
-        if feature.get("dtype") != "video":
-            continue
-
-        video_features += 1
-        video = feature.setdefault("info", {})
-        video["video.codec"] = "h264"
-        video["video.pix_fmt"] = "yuv420p"
-        video["video.g"] = 2
-        video["video.crf"] = 18
-        video["video.fast_decode"] = 0
-        video.pop("video.preset", None)
-        video.pop("video.extra_options", None)
-
-    if video_features == 0:
-        raise RuntimeError(f"No video features in {info_path}")
-
-    info_path.write_text(
-        json.dumps(info, indent=4) + "\n",
-        encoding="utf-8",
-    )
+    print(f"source gripper range: [{observed_min:.4f}, {observed_max:.4f}]")
 
 
-def _h264_videos_are_complete(src: Path, dst: Path) -> bool:
-    source_videos = sorted(
-        path.relative_to(src)
-        for path in src.rglob("*.mp4")
-    )
-    target_videos = sorted(
-        path.relative_to(dst)
-        for path in dst.rglob("*.mp4")
-    )
-
-    if not source_videos or target_videos != source_videos:
-        return False
-
-    try:
-        return all(
-            _video_codec(dst / relative) == "h264"
-            for relative in target_videos
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return False
-
-
-def _prepare_h264_suite(src: Path, dst: Path) -> Path:
-    marker = dst / ".h264_source_ready"
-
+def _prepare_fixed_suite(src: Path, dst: Path, repo_id: str) -> Path:
+    """Create an action-fixed copy atomically; original videos stay in their codec."""
+    marker = dst / ".gripper_env_convention"
     if marker.exists():
-        if not (dst / "meta" / "info.json").exists():
-            raise FileNotFoundError(dst / "meta" / "info.json")
-        return dst
-
-    # Reuse a complete manual H264 transcode if it already exists.
-    if dst.exists() and _h264_videos_are_complete(src, dst):
-        _copy_non_video_files(src, dst)
-        _patch_h264_metadata(dst)
-        marker.write_text("av1_cuvid -> h264_nvenc\n", encoding="utf-8")
-        print(f"H264 source reused: {dst}")
         return dst
 
     tmp = dst.with_name(dst.name + ".tmp")
     shutil.rmtree(tmp, ignore_errors=True)
-    shutil.rmtree(dst, ignore_errors=True)
-    _copy_non_video_files(src, tmp)
+    if dst.exists():
+        # An interrupted conversion is unsafe to resume because it may contain a
+        # mixture of [0,1] and [-1,1] actions. Rebuild from immutable raw data.
+        shutil.rmtree(dst)
 
-    source_videos = sorted(src.rglob("*.mp4"))
-    if not source_videos:
-        raise RuntimeError(f"No MP4 videos found in {src}")
-
-    for index, source_video in enumerate(source_videos, start=1):
-        relative = source_video.relative_to(src)
-        target_video = tmp / relative
-        target_video.parent.mkdir(parents=True, exist_ok=True)
-
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-v",
-                "error",
-                "-c:v",
-                "av1_cuvid",
-                "-i",
-                str(source_video),
-                "-map",
-                "0:v:0",
-                "-fps_mode",
-                "passthrough",
-                "-c:v",
-                "h264_nvenc",
-                "-preset",
-                "p4",
-                "-cq",
-                "18",
-                "-g",
-                "2",
-                "-bf",
-                "0",
-                "-pix_fmt",
-                "yuv420p",
-                "-movflags",
-                "+faststart",
-                "-an",
-                str(target_video),
-            ],
-            check=True,
-        )
-
-        if _video_codec(target_video) != "h264":
-            raise RuntimeError(
-                f"Transcode did not produce H264: {target_video}"
-            )
-
-        print(
-            f"[{index}/{len(source_videos)}] AV1 -> H264: "
-            f"{source_video}"
-        )
-
-    _patch_h264_metadata(tmp)
-    (tmp / ".h264_source_ready").write_text(
-        "av1_cuvid -> h264_nvenc\n",
-        encoding="utf-8",
-    )
-    tmp.replace(dst)
-    print(f"H264 source ready: {len(source_videos)} videos")
-    return dst
-
-
-def _convert_gripper_in_place(root: Path) -> None:
-    marker = root / ".gripper_env_convention"
-    if marker.exists():
-        return
-
-    for parquet in sorted((root / "data").rglob("*.parquet")):
-        frame = pd.read_parquet(parquet)
-        if "action" not in frame.columns:
-            raise KeyError(f"{parquet}: action column missing")
-
-        def convert(action):
-            action = np.asarray(action, dtype=np.float32).copy()
-            if action.shape[-1] != 7:
-                raise ValueError(
-                    f"Expected action dim 7, got {action.shape}"
-                )
-            gripper = np.asarray(action[..., -1])
-            if gripper.min() < -1e-4 or gripper.max() > 1.0001:
-                raise ValueError(
-                    f"Source gripper must be in [0,1], got "
-                    f"[{gripper.min()},{gripper.max()}]"
-                )
-            action[..., -1] = 1.0 - 2.0 * gripper
-            return action.tolist()
-
-        frame["action"] = frame["action"].map(convert)
-        frame.to_parquet(parquet, index=False)
+    _copy_for_action_fix(src, tmp)
+    _convert_gripper_parquets(tmp)
 
     from lerobot.datasets.dataset_tools import recompute_stats
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    dataset = LeRobotDataset(
-        f"local/{root.name}_fixed",
-        root=root,
-    )
+    dataset = LeRobotDataset(repo_id, root=tmp, video_backend=VIDEO_BACKEND)
     recompute_stats(dataset, skip_image_video=True)
-    marker.write_text(
-        "g_env=1-2*g_data\n",
+    (tmp / ".gripper_env_convention").write_text(
+        "g_env = 1 - 2 * g_data; source videos preserved\n",
         encoding="utf-8",
     )
+    tmp.replace(dst)
+    return dst
+
+
+def _normalize_instruction(text: str) -> str:
+    return " ".join(str(text).strip().lower().split())
 
 
 def _episodes_for_instruction(dataset, instruction: str) -> list[int]:
-    selected = []
-    for episode in range(dataset.meta.total_episodes):
-        tasks = [
-            str(x).strip()
-            for x in dataset.meta.episodes[episode]["tasks"]
-        ]
-        if instruction in tasks:
+    wanted = _normalize_instruction(instruction)
+    selected: list[int] = []
+    for episode in range(int(dataset.meta.total_episodes)):
+        tasks = dataset.meta.episodes[episode]["tasks"]
+        if any(_normalize_instruction(task) == wanted for task in tasks):
             selected.append(episode)
     return selected
 
 
-def target_repo_id(task_id: int, k: int) -> str:
-    return f"local/libero_goal_fixed_t{task_id}_k{k}"
+def target_episode_ids(task_id: int, k: int | None = None) -> list[int]:
+    if task_id not in TARGETS:
+        raise ValueError(f"Unknown target task_id={task_id}")
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-
-def subset_root(task_id: int, k: int) -> Path:
-    if task_id not in TARGETS or k not in BUDGETS:
-        raise ValueError((task_id, k))
-    root = SUBSETS / f"t{task_id}_k{k}"
-    if not root.exists():
-        raise FileNotFoundError(f"{root}; run prepare_data()")
-    return root
-
-
-def _subset_is_complete(root: Path, task_id: int, k: int) -> bool:
-    if not root.exists():
-        return False
-
-    try:
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-        dataset = LeRobotDataset(
-            target_repo_id(task_id, k),
-            root=root,
+    dataset = LeRobotDataset(
+        GOAL_REPO_ID,
+        root=GOAL_TRAIN_ROOT,
+        video_backend=VIDEO_BACKEND,
+    )
+    episodes = _episodes_for_instruction(dataset, TARGETS[task_id])
+    if len(episodes) < max(BUDGETS):
+        raise RuntimeError(
+            f"Target '{TARGETS[task_id]}' has only {len(episodes)} episodes; "
+            f"need at least {max(BUDGETS)}."
         )
-        return int(dataset.meta.total_episodes) == k
-    except Exception:
-        return False
+    return episodes if k is None else episodes[:k]
+
+
+def seen_instructions() -> list[str]:
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    dataset = LeRobotDataset(
+        SEEN_REPO_ID,
+        root=SEEN_TRAIN_ROOT,
+        video_backend=VIDEO_BACKEND,
+    )
+    values: list[str] = []
+    seen: set[str] = set()
+    for episode in range(int(dataset.meta.total_episodes)):
+        for task in dataset.meta.episodes[episode]["tasks"]:
+            text = str(task).strip()
+            key = _normalize_instruction(text)
+            if key and key not in seen:
+                seen.add(key)
+                values.append(text)
+    return values
+
+
+def seen_sanity_tasks(n: int = 3) -> list[tuple[int, str]]:
+    """Find benchmark task ids whose language strings really occur in libero_90."""
+    from libero.libero import benchmark
+
+    present = {_normalize_instruction(x) for x in seen_instructions()}
+    suite = benchmark.get_benchmark_dict()["libero_90"]()
+    matches: list[tuple[int, str]] = []
+    for task_id in range(int(suite.get_num_tasks())):
+        task = suite.get_task(task_id)
+        text = getattr(task, "language", None)
+        if text is None and isinstance(task, dict):
+            text = task.get("language")
+        if text is None:
+            continue
+        text = str(text).strip()
+        if _normalize_instruction(text) in present:
+            matches.append((task_id, text))
+        if len(matches) >= n:
+            break
+    if len(matches) < n:
+        raise RuntimeError(
+            f"Only {len(matches)} LIBERO-90 benchmark tasks could be matched to dataset text."
+        )
+    return matches
+
+
+
+def _selected_numeric_stats(dataset) -> dict:
+    """Compute normalization stats only from the episodes selected in ``dataset``."""
+    from lerobot.datasets.compute_stats import aggregate_stats, compute_episode_stats
+
+    meta_keys = {"index", "episode_index", "task_index", "frame_index", "timestamp"}
+    numeric_features = {
+        key: feature
+        for key, feature in dataset.meta.features.items()
+        if feature["dtype"] not in {"image", "video", "string", "language"} and key not in meta_keys
+    }
+    if not numeric_features:
+        return dict(dataset.meta.stats)
+
+    hf = dataset.hf_dataset.with_format(None)
+    episode_index = np.asarray(hf["episode_index"], dtype=np.int64)
+    arrays: dict[str, np.ndarray] = {}
+    for key in numeric_features:
+        if key not in hf.column_names:
+            continue
+        values = hf[key]
+        array = np.asarray(values)
+        if array.dtype == object:
+            array = np.stack([np.asarray(value) for value in values])
+        arrays[key] = array
+
+    selected = dataset.episodes
+    if selected is None:
+        selected = sorted(np.unique(episode_index).tolist())
+
+    episode_stats = []
+    for source_episode in selected:
+        mask = episode_index == int(source_episode)
+        if not bool(mask.any()):
+            raise RuntimeError(f"Selected episode {source_episode} is absent from the loaded HF rows")
+        episode_data = {key: array[mask] for key, array in arrays.items()}
+        episode_stats.append(compute_episode_stats(episode_data, numeric_features))
+
+    stats = aggregate_stats(episode_stats)
+    # Image/video statistics are not recomputed. SmolVLA uses identity normalization
+    # for visual inputs, but retaining the existing entries keeps the metadata complete.
+    for key, value in dataset.meta.stats.items():
+        if key not in stats:
+            stats[key] = value
+    return stats
+
+
+def _make_target_view(task_id: int, k: int, chosen: list[int]) -> tuple[str, Path]:
+    """Create a tiny metadata view with K-only normalization stats; data/videos are symlinked."""
+    from lerobot.datasets.io_utils import write_stats
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    repo_id = f"local/libero_goal_t{task_id}_k{k}"
+    dst = VIEWS / f"libero_goal_t{task_id}_k{k}"
+    marker = dst / ".selection"
+    expected = ",".join(str(int(x)) for x in chosen)
+    current_links = False
+    if marker.exists():
+        try:
+            data_link = dst / "data"
+            videos_link = dst / "videos"
+            data_ok = data_link.exists() and data_link.resolve() == (GOAL_TRAIN_ROOT / "data").resolve()
+            source_videos = GOAL_TRAIN_ROOT / "videos"
+            videos_ok = (
+                (not source_videos.exists() and not videos_link.exists())
+                or (videos_link.exists() and videos_link.resolve() == source_videos.resolve())
+            )
+            current_links = data_ok and videos_ok
+        except OSError:
+            current_links = False
+    if (
+        marker.exists()
+        and marker.read_text(encoding="utf-8").strip() == expected
+        and current_links
+    ):
+        return repo_id, dst
+
+    tmp = dst.with_name(dst.name + ".tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    shutil.rmtree(dst, ignore_errors=True)
+    tmp.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(GOAL_TRAIN_ROOT / "meta", tmp / "meta")
+    for name in ("data", "videos"):
+        source = (GOAL_TRAIN_ROOT / name).resolve()
+        if source.exists():
+            (tmp / name).symlink_to(source, target_is_directory=True)
+
+    selected = LeRobotDataset(
+        GOAL_REPO_ID,
+        root=GOAL_TRAIN_ROOT,
+        episodes=chosen,
+        video_backend=VIDEO_BACKEND,
+    )
+    stats = _selected_numeric_stats(selected)
+    write_stats(stats, tmp)
+    (tmp / ".selection").write_text(expected + "\n", encoding="utf-8")
+    tmp.replace(dst)
+
+    check = LeRobotDataset(repo_id, root=dst, episodes=chosen, video_backend=VIDEO_BACKEND)
+    if [int(x) for x in check.episodes] != [int(x) for x in chosen]:
+        raise RuntimeError(f"Target view t{task_id}/k{k} did not preserve source episode ids")
+    return repo_id, dst
+
+
+def target_training_source(task_id: int, k: int) -> tuple[str, Path, list[int]]:
+    """Return the leak-free metadata view used for target fine-tuning."""
+    chosen = target_episode_ids(task_id, k)
+    repo_id, root = _make_target_view(task_id, k, chosen)
+    return repo_id, root, chosen
+
+def _validate_selected_episodes(task_id: int, chosen: list[int]) -> int:
+    """Use the exact LeRobot 0.6.1 episode filter and verify the result."""
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    dataset = LeRobotDataset(
+        GOAL_REPO_ID,
+        root=GOAL_TRAIN_ROOT,
+        episodes=chosen,
+        video_backend=VIDEO_BACKEND,
+    )
+    loaded = [int(x) for x in dataset.episodes]
+    if loaded != [int(x) for x in chosen]:
+        raise RuntimeError(
+            f"t{task_id}: LeRobot loaded episodes {loaded}, requested {chosen}. "
+            "Do not train until the dataset version/filtering is fixed."
+        )
+    if int(dataset.num_episodes) != len(chosen):
+        raise RuntimeError(
+            f"t{task_id}: selected dataset reports {dataset.num_episodes} episodes, "
+            f"expected {len(chosen)}."
+        )
+    return int(dataset.num_frames)
+
+
+def _decode_smoke(repo_id: str, root: Path, episode: int = 0) -> None:
+    """Decode real video tensors before any expensive training starts."""
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    dataset = LeRobotDataset(
+        repo_id,
+        root=root,
+        episodes=[episode],
+        video_backend=VIDEO_BACKEND,
+    )
+    if len(dataset) == 0:
+        raise RuntimeError(f"Decode smoke dataset is empty: {root}")
+    sample = dataset[0]
+    missing = [key for key in dataset.meta.video_keys if key not in sample]
+    if missing:
+        raise RuntimeError(f"Video decoder did not return keys: {missing}")
+    for key in dataset.meta.video_keys:
+        tensor = sample[key]
+        shape = tuple(getattr(tensor, "shape", ()))
+        if len(shape) != 3:
+            raise RuntimeError(f"Decoded {key} has unexpected shape {shape}")
 
 
 def prepare_data(force: bool = False) -> dict:
+    """Download, fix gripper convention, verify AV1 decoding and exact K subsets."""
     if force:
         shutil.rmtree(FIXED, ignore_errors=True)
-        shutil.rmtree(SUBSETS, ignore_errors=True)
+        shutil.rmtree(VIEWS, ignore_errors=True)
 
     RAW.mkdir(parents=True, exist_ok=True)
-    H264.mkdir(parents=True, exist_ok=True)
     FIXED.mkdir(parents=True, exist_ok=True)
-    SUBSETS.mkdir(parents=True, exist_ok=True)
+    VIEWS.mkdir(parents=True, exist_ok=True)
 
     seen_raw = _download_suite("libero_90")
     goal_raw = _download_suite("libero_goal")
+    _prepare_fixed_suite(seen_raw, SEEN_TRAIN_ROOT, SEEN_REPO_ID)
+    _prepare_fixed_suite(goal_raw, GOAL_TRAIN_ROOT, GOAL_REPO_ID)
 
-    seen_h264 = _prepare_h264_suite(
-        seen_raw,
-        H264 / "libero_90",
-    )
-    goal_h264 = _prepare_h264_suite(
-        goal_raw,
-        H264 / "libero_goal",
-    )
-
-    seen = FIXED / "libero_90"
-    goal = FIXED / "libero_goal"
-
-    for source, destination in (
-        (seen_h264, seen),
-        (goal_h264, goal),
-    ):
-        marker = destination / ".gripper_env_convention"
-        if destination.exists() and not marker.exists():
-            shutil.rmtree(destination)
-
-        _copy_dataset_for_mutation(source, destination)
-        _convert_gripper_in_place(destination)
-
-    from lerobot.datasets.dataset_tools import (
-        recompute_stats,
-        split_dataset,
-    )
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    seen_dataset = LeRobotDataset(
+    seen = LeRobotDataset(
         SEEN_REPO_ID,
-        root=seen,
+        root=SEEN_TRAIN_ROOT,
+        video_backend=VIDEO_BACKEND,
     )
-    goal_dataset = LeRobotDataset(
-        "local/libero_goal_fixed",
-        root=goal,
+    goal = LeRobotDataset(
+        GOAL_REPO_ID,
+        root=GOAL_TRAIN_ROOT,
+        video_backend=VIDEO_BACKEND,
     )
 
-    for dataset_name, dataset in (
-        ("seen", seen_dataset),
-        ("goal", goal_dataset),
-    ):
-        for video_key in dataset.meta.video_keys:
-            codec = dataset.meta.info.features[video_key]["info"].get(
-                "video.codec"
-            )
-            if codec != "h264":
-                raise RuntimeError(
-                    f"{dataset_name} {video_key}: expected h264, got {codec}"
-                )
+    # This catches unsupported/broken video decoding before training.
+    _decode_smoke(SEEN_REPO_ID, SEEN_TRAIN_ROOT, episode=0)
+    _decode_smoke(GOAL_REPO_ID, GOAL_TRAIN_ROOT, episode=0)
 
-    manifest_rows = []
-
+    manifest_rows: list[dict] = []
+    target_frames: dict[str, int] = {}
     for task_id, instruction in TARGETS.items():
-        episodes = _episodes_for_instruction(
-            goal_dataset,
-            instruction,
-        )
-        if len(episodes) < 25:
-            raise RuntimeError(
-                f"{instruction}: only {len(episodes)} episodes"
-            )
-
+        all_ids = _episodes_for_instruction(goal, instruction)
+        if len(all_ids) < max(BUDGETS):
+            raise RuntimeError(f"{instruction}: only {len(all_ids)} episodes")
         for k in BUDGETS:
-            chosen = episodes[:k]
-            split_name = f"t{task_id}_k{k}"
-            output = SUBSETS / split_name
-
-            for subset_episode, source_episode in enumerate(chosen):
+            chosen = all_ids[:k]
+            frames = _validate_selected_episodes(task_id, chosen)
+            view_repo_id, view_root = _make_target_view(task_id, k, chosen)
+            target_frames[f"t{task_id}_k{k}"] = frames
+            for rank, source_episode in enumerate(chosen):
                 manifest_rows.append(
                     {
                         "task_id": task_id,
                         "instruction": instruction,
                         "K": k,
-                        "subset_episode": subset_episode,
-                        "source_episode": source_episode,
+                        "order_in_budget": rank,
+                        "source_episode": int(source_episode),
+                        "training_repo_id": view_repo_id,
+                        "training_root": str(view_root),
                     }
                 )
 
-            if not _subset_is_complete(output, task_id, k):
-                shutil.rmtree(output, ignore_errors=True)
-                made = split_dataset(
-                    goal_dataset,
-                    {split_name: chosen},
-                    output_dir=SUBSETS,
-                )[split_name]
-
-                if made.root != output:
-                    raise RuntimeError(
-                        f"Unexpected split root: "
-                        f"{made.root} != {output}"
-                    )
-
-                recompute_stats(
-                    made,
-                    skip_image_video=True,
-                )
-
-    manifest_path = DATA / "subset_manifest.csv"
-    pd.DataFrame(manifest_rows).to_csv(
-        manifest_path,
-        index=False,
-    )
-
-    target_frames = {}
-    for task_id, instruction in TARGETS.items():
-        for k in BUDGETS:
-            dataset = LeRobotDataset(
-                target_repo_id(task_id, k),
-                root=subset_root(task_id, k),
-            )
-            if int(dataset.meta.total_episodes) != k:
-                raise RuntimeError(
-                    f"t{task_id}_k{k}: "
-                    f"{dataset.meta.total_episodes} episodes, "
-                    f"expected {k}"
-                )
-
-            for episode in range(dataset.meta.total_episodes):
-                tasks = [
-                    str(x).strip()
-                    for x in dataset.meta.episodes[episode]["tasks"]
-                ]
-                if instruction not in tasks:
-                    raise RuntimeError(
-                        f"t{task_id}_k{k} episode {episode} "
-                        f"has task text {tasks}"
-                    )
-
-            target_frames[f"t{task_id}_k{k}"] = int(
-                dataset.meta.total_frames
-            )
+    manifest_path = DATA / "target_manifest.csv"
+    pd.DataFrame(manifest_rows).to_csv(manifest_path, index=False)
 
     info = {
         "seen_train_root": str(SEEN_TRAIN_ROOT),
-        "seen_train_episodes": int(
-            seen_dataset.meta.total_episodes
-        ),
-        "seen_train_frames": int(
-            seen_dataset.meta.total_frames
-        ),
+        "seen_train_episodes": int(seen.meta.total_episodes),
+        "seen_train_frames": int(seen.meta.total_frames),
+        "goal_episodes": int(goal.meta.total_episodes),
         "target_frames": target_frames,
         "target_manifest": str(manifest_path),
+        "video_backend": VIDEO_BACKEND,
+        "video_conversion": "none",
     }
     print(
         f"seen: {info['seen_train_episodes']} episodes, "
-        f"{info['seen_train_frames']} frames"
+        f"{info['seen_train_frames']} frames; video backend={VIDEO_BACKEND}"
     )
     print("target manifest:", manifest_path)
     return info
@@ -487,24 +443,24 @@ def replay_gripper_smoke(
     top_init_candidates: int = 5,
     seed: int = 123,
 ) -> dict:
+    """Replay one *dataset* demonstration in LIBERO; must reach success=1."""
     import gymnasium as gym
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.envs.libero import create_libero_envs
 
-    if task_id not in TARGETS:
-        raise ValueError(task_id)
+    chosen = target_episode_ids(task_id, k)
+    if not 0 <= episode < len(chosen):
+        raise ValueError(f"episode={episode}, selected budget has {len(chosen)} episodes")
+    source_episode = chosen[episode]
 
     dataset = LeRobotDataset(
-        target_repo_id(task_id, k),
-        root=subset_root(task_id, k),
+        GOAL_REPO_ID,
+        root=GOAL_TRAIN_ROOT,
+        video_backend=VIDEO_BACKEND,
     )
-    if episode >= dataset.meta.total_episodes:
-        raise ValueError(
-            f"episode={episode}, dataset has {dataset.meta.total_episodes}"
-        )
-
-    start = int(dataset.meta.episodes[episode]["dataset_from_index"])
-    stop = int(dataset.meta.episodes[episode]["dataset_to_index"])
+    meta = dataset.meta.episodes[source_episode]
+    start = int(meta["dataset_from_index"])
+    stop = int(meta["dataset_to_index"])
     camera_key = "observation.images.image"
 
     first_frame = dataset[start][camera_key]
@@ -518,10 +474,7 @@ def replay_gripper_smoke(
         first_frame = np.clip(first_frame, 0, 255).astype(np.uint8)
 
     actions = np.stack(
-        [
-            np.asarray(dataset[index]["action"], dtype=np.float32)
-            for index in range(start, stop)
-        ]
+        [np.asarray(dataset[index]["action"], dtype=np.float32) for index in range(start, stop)]
     )
     if actions.ndim != 2 or actions.shape[1] != 7:
         raise RuntimeError(f"Expected [T,7] actions, got {actions.shape}")
@@ -545,40 +498,38 @@ def replay_gripper_smoke(
     env = make_env()
     try:
         scores = []
-        for init_state_id in range(len(env.envs[0]._init_states)):
+        base_env = env.envs[0]
+        if base_env._init_states is None:
+            raise RuntimeError("LIBERO init states were not loaded for replay smoke")
+        for init_state_id in range(len(base_env._init_states)):
+            # LeRobot 0.6.1 exposes init_state_id specifically to choose the next
+            # LIBERO initial state. Set it explicitly instead of depending on the
+            # number of previous reset() calls.
+            base_env.init_state_id = int(init_state_id)
             observation, _ = env.reset(seed=seed)
             env_frame = np.asarray(observation["pixels"]["image"][0], dtype=np.uint8)
             if env_frame.shape != first_frame.shape:
                 raise RuntimeError(
-                    f"Camera mismatch: env {env_frame.shape}, "
-                    f"dataset {first_frame.shape}"
+                    f"Camera mismatch: env {env_frame.shape}, dataset {first_frame.shape}"
                 )
             mse = float(
-                np.mean(
-                    (
-                        env_frame.astype(np.float32)
-                        - first_frame.astype(np.float32)
-                    )
-                    ** 2
-                )
+                np.mean((env_frame.astype(np.float32) - first_frame.astype(np.float32)) ** 2)
             )
             scores.append((mse, init_state_id))
     finally:
         env.close()
 
-    for mse, init_state_id in sorted(scores)[:max(1, top_init_candidates)]:
+    for mse, init_state_id in sorted(scores)[: max(1, top_init_candidates)]:
         env = make_env()
         try:
-            for _ in range(init_state_id + 1):
-                env.reset(seed=seed)
+            env.envs[0].init_state_id = int(init_state_id)
+            env.reset(seed=seed)
 
             success = False
             used_steps = 0
             for used_steps, action in enumerate(actions, start=1):
                 _, _, terminated, truncated, info = env.step(action[None, :])
-                success_values = np.asarray(
-                    info.get("is_success", [False])
-                ).reshape(-1)
+                success_values = np.asarray(info.get("is_success", [False])).reshape(-1)
                 success = bool(success_values[0]) if len(success_values) else False
                 terminal = bool(np.asarray(terminated).reshape(-1)[0])
                 timed_out = bool(np.asarray(truncated).reshape(-1)[0])
@@ -591,6 +542,7 @@ def replay_gripper_smoke(
                     "instruction": TARGETS[task_id],
                     "K": k,
                     "episode": episode,
+                    "source_episode": int(source_episode),
                     "success": True,
                     "matched_init_state": int(init_state_id),
                     "steps": int(used_steps),
@@ -600,6 +552,5 @@ def replay_gripper_smoke(
             env.close()
 
     raise RuntimeError(
-        f"Replay failed for task {task_id}. "
-        "Check gripper conversion, task mapping and LIBERO setup."
+        f"Replay failed for task {task_id}. Check gripper conversion, task mapping and LIBERO setup."
     )
